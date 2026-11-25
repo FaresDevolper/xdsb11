@@ -1,1 +1,21 @@
+  "name": "voice-guard-bot",
+  "version": "1.0.0",
+  "description": "بوت حماية القذف في الرومات الصوتية",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "@snazzah/davey": "^0.1.10",
+    "discord.js": "^14.25.1",
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.0.8",
+    "prism-media": "^1.3.5"
+  }
+}
+
 
