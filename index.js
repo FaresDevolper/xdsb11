@@ -3,6 +3,9 @@
 /*
  * بوت حماية القذف في الرومات الصوتية
  * يسمع كل شخص لحاله -> يحول الصوت لنص (Whisper) -> يفحص الكلمات القوية -> تايم اوت + لوق للمشرفين
+ *
+ * الروم المحدد: يتحط في متغير البيئة WATCH_CHANNEL_ID (في Render > Environment)
+ * البوت يرجع للروم تلقائياً إذا طلع / انفصل / انسحب لروم ثاني، وينفك عنه الميوت والدفن على طول.
  */
 
 const http = require('http');
@@ -14,7 +17,6 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ChannelType,
   SlashCommandBuilder,
   ActivityType,
   MessageFlags,
@@ -37,7 +39,7 @@ const CFG = {
   token: env.DISCORD_TOKEN,
   guildId: env.GUILD_ID,
   logChannelId: env.LOG_CHANNEL_ID,
-  watchChannelId: env.WATCH_CHANNEL_ID || null,
+  watchChannelId: env.WATCH_CHANNEL_ID, // <<< ID الروم الصوتي يتحط هنا (متغير بيئة)
   sttKey: env.STT_API_KEY,
   sttUrl: env.STT_API_URL || 'https://api.groq.com/openai/v1/audio/transcriptions',
   sttModel: env.STT_MODEL || 'whisper-large-v3',
@@ -66,6 +68,10 @@ const CONCURRENCY = 2;
 const MAX_QUEUE = 20;
 const COOLDOWN_MS = 60_000;
 
+// الحماية من الطلوع
+const RETURN_DELAY_MS = 300; // التأخير قبل الرجوع (عشان ما نعلق في لوب لو انسحب مرتين ورا بعض)
+const WATCHDOG_MS = 10_000; // فحص دوري احتياطي
+
 const SAFE_TZ = (() => {
   try {
     new Intl.DateTimeFormat('en-GB', { timeZone: CFG.tz });
@@ -83,12 +89,18 @@ http
   })
   .listen(CFG.port, () => console.log(`[http] listening on ${CFG.port}`));
 
-const missing = ['token', 'guildId', 'logChannelId', 'sttKey'].filter((k) => !CFG[k]);
+const missing = ['token', 'guildId', 'logChannelId', 'watchChannelId', 'sttKey'].filter((k) => !CFG[k]);
 if (missing.length) {
   console.error(
     '[config] ناقص: ' +
       missing
-        .map((k) => ({ token: 'DISCORD_TOKEN', guildId: 'GUILD_ID', logChannelId: 'LOG_CHANNEL_ID', sttKey: 'STT_API_KEY' }[k]))
+        .map((k) => ({
+          token: 'DISCORD_TOKEN',
+          guildId: 'GUILD_ID',
+          logChannelId: 'LOG_CHANNEL_ID',
+          watchChannelId: 'WATCH_CHANNEL_ID',
+          sttKey: 'STT_API_KEY',
+        }[k]))
         .join(', ')
   );
   process.exit(1);
@@ -105,8 +117,9 @@ const client = new Client({
 const state = {
   connection: null,
   channelId: null,
-  wantedChannelId: null,
+  wantedChannelId: CFG.watchChannelId, // الروم المحدد ثابت من أول التشغيل
   rejoinTimer: null,
+  joining: false,
   capturing: new Set(),
 };
 
@@ -502,101 +515,146 @@ function stopWatching(clearWanted = true) {
   }
 }
 
-function scheduleRejoin(delay = 5000) {
+/**
+ * يتأكد إن البوت داخل الروم المحدد وإلا يرجعه.
+ * تنادى من: حدث voiceStateUpdate، وإذا انهدم الاتصال، وفحص دوري احتياطي.
+ */
+async function ensureWatching() {
+  if (!state.wantedChannelId || state.joining) return;
+  const guild = getGuild();
+  if (!guild) return;
+
+  const myVoice = guild.voiceStates.cache.get(client.user.id);
+  const inRightRoom = myVoice?.channelId === state.wantedChannelId;
+  const connAlive =
+    state.connection && state.connection.state.status !== VoiceConnectionStatus.Destroyed;
+  if (inRightRoom && connAlive) return;
+
+  const ch =
+    guild.channels.cache.get(state.wantedChannelId) ||
+    (await guild.channels.fetch(state.wantedChannelId).catch(() => null));
+  if (!ch || !ch.isVoiceBased()) {
+    console.error('[voice] الروم المحدد غير موجود أو مو صوتي، تأكد من WATCH_CHANNEL_ID');
+    return;
+  }
+  if (state.joining) return;
+
+  try {
+    await joinWatch(ch);
+    console.log('[voice] رجعت للروم المحدد');
+  } catch (e) {
+    console.error('[voice] rejoin failed:', e.message);
+    scheduleRejoin(5000);
+  }
+}
+
+function scheduleRejoin(delay = 1000) {
   if (!state.wantedChannelId || state.rejoinTimer) return;
-  state.rejoinTimer = setTimeout(async () => {
+  state.rejoinTimer = setTimeout(() => {
     state.rejoinTimer = null;
-    if (!state.wantedChannelId || state.connection) return;
-    const ch = getGuild()?.channels.cache.get(state.wantedChannelId);
-    if (!ch) return;
-    try {
-      await joinWatch(ch);
-      console.log('[voice] rejoined');
-    } catch (e) {
-      console.error('[voice] rejoin failed:', e.message);
-      scheduleRejoin(15000);
-    }
+    ensureWatching();
   }, delay);
 }
 
 async function joinWatch(channel, { announce = false } = {}) {
-  stopWatching(false);
-  state.wantedChannelId = channel.id;
-
-  const connection = joinVoiceChannel({
-    channelId: channel.id,
-    guildId: channel.guild.id,
-    adapterCreator: channel.guild.voiceAdapterCreator,
-    selfDeaf: false, // لازم false عشان يقدر يسمع
-    selfMute: true,
-  });
-  state.connection = connection;
-  state.channelId = channel.id;
-
-  connection.on('error', (e) => console.error('[voice] connection error:', e.message));
-
+  state.joining = true;
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-  } catch {
-    if (state.connection === connection) {
-      state.connection = null;
-      state.channelId = null;
-    }
-    try {
-      connection.destroy();
-    } catch {}
-    throw new Error('تعذر الاتصال بالروم الصوتي (تأكد من صلاحية Connect و View Channel)');
-  }
+    stopWatching(false);
+    state.wantedChannelId = channel.id;
 
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    const connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: channel.guild.id,
+      adapterCreator: channel.guild.voiceAdapterCreator,
+      selfDeaf: false, // لازم false عشان يقدر يسمع
+      selfMute: true,
+    });
+    state.connection = connection;
+    state.channelId = channel.id;
+
+    connection.on('error', (e) => console.error('[voice] connection error:', e.message));
+
     try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
+      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     } catch {
+      if (state.connection === connection) {
+        state.connection = null;
+        state.channelId = null;
+      }
       try {
         connection.destroy();
       } catch {}
+      throw new Error('تعذر الاتصال بالروم الصوتي (تأكد من صلاحية Connect و View Channel)');
     }
-  });
 
-  connection.on(VoiceConnectionStatus.Destroyed, () => {
-    if (state.connection === connection) {
-      state.connection = null;
-      state.channelId = null;
-      state.capturing.clear();
-      scheduleRejoin();
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        await Promise.race([
+          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+        ]);
+      } catch {
+        try {
+          connection.destroy();
+        } catch {}
+      }
+    });
+
+    connection.on(VoiceConnectionStatus.Destroyed, () => {
+      if (state.connection === connection) {
+        state.connection = null;
+        state.channelId = null;
+        state.capturing.clear();
+        scheduleRejoin(RETURN_DELAY_MS);
+      }
+    });
+
+    connection.receiver.speaking.on('start', (userId) => capture(userId));
+
+    console.log(`[voice] watching #${channel.name}`);
+
+    if (announce && CFG.announce && typeof channel.send === 'function') {
+      channel
+        .send('🛡️ هذا الروم تحت **حماية القذف الصوتية**. يتم تحويل الكلام لنص بشكل مؤقت للكشف عن القذف والسب فقط، ولا يتم حفظ أي تسجيل.')
+        .catch(() => {});
     }
-  });
-
-  connection.receiver.speaking.on('start', (userId) => capture(userId));
-
-  console.log(`[voice] watching #${channel.name}`);
-
-  if (announce && CFG.announce && typeof channel.send === 'function') {
-    channel
-      .send('🛡️ هذا الروم تحت **حماية القذف الصوتية**. يتم تحويل الكلام لنص بشكل مؤقت للكشف عن القذف والسب فقط، ولا يتم حفظ أي تسجيل.')
-      .catch(() => {});
+  } finally {
+    state.joining = false;
   }
 }
 
+// ============================ حماية البوت نفسه (رجوع + فك الميوت والدفن) ============================
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  try {
+    if (newState.guild.id !== CFG.guildId) return;
+    if (newState.id !== client.user.id) return;
+    if (!state.wantedChannelId) return;
+
+    // أحد عطاه ميوت سيرفر -> ينفك
+    if (newState.channelId && newState.serverMute) {
+      newState
+        .setMute(false, 'حماية: البوت لازم يبقى غير مكتوم')
+        .catch((e) => console.error('[voice] unmute failed (تأكد من صلاحية Mute Members):', e.message));
+    }
+
+    // أحد عطاه دفن سيرفر -> ينفك (الدفن يمنعه يسمع)
+    if (newState.channelId && newState.serverDeaf) {
+      newState
+        .setDeaf(false, 'حماية: البوت لازم يبقى غير مدفون')
+        .catch((e) => console.error('[voice] undeafen failed (تأكد من صلاحية Deafen Members):', e.message));
+    }
+
+    // طلع / انفصل / انسحب لروم ثاني -> يرجع للروم المحدد
+    if (newState.channelId !== state.wantedChannelId) {
+      setTimeout(() => ensureWatching(), RETURN_DELAY_MS);
+    }
+  } catch (e) {
+    console.error('[voiceStateUpdate] error:', e);
+  }
+});
+
 // ============================ الأوامر ============================
 const commands = [
-  new SlashCommandBuilder()
-    .setName('join')
-    .setDescription('يدخل البوت الروم الصوتي ويبدأ حماية القذف')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addChannelOption((o) =>
-      o
-        .setName('channel')
-        .setDescription('الروم الصوتي (اختياري، الافتراضي رومك الحالي)')
-        .addChannelTypes(ChannelType.GuildVoice)
-    ),
-  new SlashCommandBuilder()
-    .setName('leave')
-    .setDescription('يخرج البوت من الروم الصوتي ويوقف الحماية')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
   new SlashCommandBuilder()
     .setName('status')
     .setDescription('حالة البوت وإحصائيات الجلسة')
@@ -617,28 +675,12 @@ async function handleCommand(i) {
   }
 
   switch (i.commandName) {
-    case 'join': {
-      await i.deferReply({ flags: EPHEMERAL });
-      const ch = i.options.getChannel('channel') || i.member.voice?.channel;
-      if (!ch || ch.type !== ChannelType.GuildVoice) {
-        return i.editReply('ادخل روم صوتي أولاً أو حدد الروم في الأمر.');
-      }
-      const real = i.guild.channels.cache.get(ch.id);
-      if (!real?.joinable) return i.editReply('ما أقدر أدخل هذا الروم، تأكد من صلاحيات View Channel و Connect.');
-      try {
-        await joinWatch(real, { announce: true });
-        return i.editReply(`✅ دخلت <#${real.id}> والحماية شغالة.`);
-      } catch (e) {
-        return i.editReply(`❌ ${e.message}`);
-      }
-    }
-    case 'leave': {
-      stopWatching(true);
-      return i.reply({ content: '✅ خرجت من الروم وأوقفت الحماية.', flags: EPHEMERAL });
-    }
     case 'status': {
+      const myVoice = getGuild()?.voiceStates.cache.get(client.user.id);
       const lines = [
-        `الروم: ${state.channelId ? `<#${state.channelId}>` : 'غير متصل'}`,
+        `الروم المحدد: <#${CFG.watchChannelId}>`,
+        `الروم الحالي: ${myVoice?.channelId ? `<#${myVoice.channelId}>` : 'غير متصل'}`,
+        `ميوت سيرفر: ${myVoice?.serverMute ? 'نعم' : 'لا'} | دفن سيرفر: ${myVoice?.serverDeaf ? 'نعم' : 'لا'}`,
         `مدة التايم اوت: ${CFG.timeoutMin} دقائق`,
         `مقاطع تم التقاطها: ${stats.clips}`,
         `تم تحويلها لنص: ${stats.transcribed}`,
@@ -711,20 +753,20 @@ client.once(Events.ClientReady, async () => {
     .then(() => console.log('[bot] commands registered'))
     .catch((e) => console.error('[bot] commands failed:', e.message));
 
-  if (CFG.watchChannelId) {
-    const ch = await guild.channels.fetch(CFG.watchChannelId).catch(() => null);
-    if (ch && ch.isVoiceBased()) {
-      state.wantedChannelId = ch.id;
-      try {
-        await joinWatch(ch);
-      } catch (e) {
-        console.error('[voice] auto join failed:', e.message);
-        scheduleRejoin(15000);
-      }
-    } else {
-      console.error('[bot] WATCH_CHANNEL_ID غير صالح');
+  const ch = await guild.channels.fetch(CFG.watchChannelId).catch(() => null);
+  if (ch && ch.isVoiceBased()) {
+    try {
+      await joinWatch(ch, { announce: true });
+    } catch (e) {
+      console.error('[voice] auto join failed:', e.message);
+      scheduleRejoin(5000);
     }
+  } else {
+    console.error('[bot] WATCH_CHANNEL_ID غير صالح');
   }
+
+  // فحص دوري احتياطي: لو فاتنا أي حدث، البوت يرجع لروم المحدد
+  setInterval(() => ensureWatching(), WATCHDOG_MS);
 });
 
 client.on('error', (e) => console.error('[client] error:', e));
