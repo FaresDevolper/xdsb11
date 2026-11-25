@@ -98,6 +98,5 @@ function findBadWords(text) {
 
   return hits;
 }
-... (3 lines left)
 
-
+module.exports = { normalize, collapse, findBadWords };
